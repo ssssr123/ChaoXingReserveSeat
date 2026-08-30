@@ -3,6 +3,7 @@ import time
 import argparse
 import os
 import logging
+import datetime
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -25,14 +26,19 @@ get_current_dayofweek = lambda action: (
 RUN_ONCE = True
 SLEEPTIME = 0.2  # 每次抢座的间隔
 ENDTIME = "20:02:00"  # 根据学校的预约座位时间+1min即可
-RESERVE_TIME = "20:00:00"  # 北京时间
-PREWARM_LEAD_SECONDS = 20  # 正式预约前多少秒完成运行环境和网络预热
+RESERVE_TIME = "20:00:03"  # 北京时间，第一枪开火（T0+3s）
+PREWARM_LEAD_SECONDS = 25  # 开火前多少秒完成环境预热+登录
+PACKET_LEAD_SECONDS = 8  # 开火前多少秒开始做第一枪预热包
 
 ENABLE_SLIDER = True  # 是否有滑块验证
 MAX_ATTEMPT = 1  # 最大尝试次数
 RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
-POST_LOGIN_DELAY = 1.0   # 登录成功后等待2秒
+POST_LOGIN_DELAY = 0.0
 RETRY_INTERVAL = 15.0    # 整批失败后等待15秒
+
+def beijing_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+
 
 def create_reserve_clients(user_count):
     clients = []
@@ -46,6 +52,48 @@ def create_reserve_clients(user_count):
         client.warm_up()
         clients.append(client)
     return clients
+
+
+def primary_seat(seatid):
+    if isinstance(seatid, (list, tuple)):
+        return str(seatid[0]).strip()
+    return str(seatid).strip()
+
+
+def login_user(client, username, password):
+    if client.logged_in:
+        return True
+    client.get_login_status()
+    login_success, msg = client.login(username, password)
+    if not login_success:
+        logging.info(f"登录失败: {msg}")
+        return False
+    return True
+
+
+def two_shot_reserve(client, times, roomid, seatid, action, prepared_packet=None):
+    seat = primary_seat(seatid)
+    logging.info(f"两枪策略 座位 {seat} 第一枪预热包丢掉，第二枪现场做包")
+
+    packet1 = prepared_packet
+    if packet1 is None:
+        logging.warning("开火时预热包未就绪，现场补做第一枪包")
+        packet1 = client.prepare_packet(times, roomid, seat, action)
+
+    ok1, msg1 = client.fire_packet(packet1, action, "第一枪")
+    packet1 = None
+    if ok1:
+        logging.info("第一枪预约成功")
+        return True
+    logging.info(f"第一枪结束 msg={msg1}，丢掉预热包，现场做第二枪")
+
+    packet2 = client.prepare_packet(times, roomid, seat, action)
+    ok2, msg2 = client.fire_packet(packet2, action, "第二枪")
+    if ok2:
+        logging.info("第二枪预约成功")
+        return True
+    logging.info(f"第二枪未成功 msg={msg2}")
+    return False
 
 
 def login_and_reserve(
@@ -90,8 +138,7 @@ def login_and_reserve(
                 f"登录后等待 {POST_LOGIN_DELAY} 秒再预约"
                 )
                 time.sleep(POST_LOGIN_DELAY)
-            s.requests.headers.update({"Host": "office.chaoxing.com"})
-            suc = s.submit(times, roomid, seatid, action)
+            suc = two_shot_reserve(s, times, roomid, seatid, action)
             success_list[index] = suc
     return success_list, clients
 
@@ -104,70 +151,91 @@ def main(users, action=False):
     if action:
         usernames, passwords = get_user_credentials(action)
 
-        # 2. 第二步：在预约时间前完成预热，避免首个座位承担冷启动耗时
-        import datetime
-        reserve_clock = datetime.datetime.strptime(
-            RESERVE_TIME, "%H:%M:%S"
-        ).time()
+        # 2. 开火前：环境预热 + 登录 + 第一枪做包
+        fire_clock = datetime.datetime.strptime(RESERVE_TIME, "%H:%M:%S").time()
         logging.info(
-            f"GitHub Action 模式已启动，等待北京时间 {RESERVE_TIME}..."
+            f"GitHub Action 模式已启动，等待北京时间 {RESERVE_TIME} 打第一枪..."
         )
+        prepared = {}
         while True:
-            now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-            target = datetime.datetime.combine(now.date(), reserve_clock)
-            # Support test times shortly after midnight when the workflow starts
-            # on the previous evening. A target more than 12 hours in the past
-            # is treated as the next day's target.
+            now = beijing_now()
+            target = datetime.datetime.combine(now.date(), fire_clock)
             if (now - target).total_seconds() > 12 * 3600:
                 target += datetime.timedelta(days=1)
             remaining_seconds = (target - now).total_seconds()
 
             if clients is None and remaining_seconds <= PREWARM_LEAD_SECONDS:
-                logging.info("开始预约前预热...")
+                logging.info("开始预约前预热并登录...")
                 clients = create_reserve_clients(len(users))
+                for index, user in enumerate(users):
+                    username, password = (
+                        usernames.split(",")[index].strip(),
+                        passwords.split(",")[index].strip(),
+                    )
+                    login_user(clients[index], username, password)
+
+            if (
+                clients is not None
+                and remaining_seconds <= PACKET_LEAD_SECONDS
+            ):
+                for index, user in enumerate(users):
+                    if index in prepared:
+                        continue
+                    if not clients[index].logged_in:
+                        continue
+                    _username, _password, times, roomid, seatid, _days = user.values()
+                    seat = primary_seat(seatid)
+                    logging.info(f"开始准备第一枪预热包 座位 {seat}")
+                    prepared[index] = clients[index].prepare_packet(
+                        times, roomid, seat, action
+                    )
 
             if remaining_seconds <= 0:
-                logging.info(f"到达预定时间: {now.strftime('%H:%M:%S')}，开始抢座！")
+                logging.info(
+                    f"到达开火时间: {now.strftime('%H:%M:%S.%f')[:-3]}，打第一枪"
+                )
                 break
 
-            time.sleep(1 if remaining_seconds > 10 else 0.05)
+            time.sleep(1 if remaining_seconds > 10 else 0.02)
 
     if clients is None:
         clients = create_reserve_clients(len(users))
 
-    # 3. 第三步：原有的抢座逻辑开始执行
     current_time = get_current_time(action)
     logging.info(f"start time {current_time}, action {'on' if action else 'off'}")
-    attempt_times = 0
-    success_list = None
+    success_list = [False] * len(users)
     current_dayofweek = get_current_dayofweek(action)
     today_reservation_num = sum(
         1 for d in users if current_dayofweek in d.get("daysofweek")
     )
-    
-    while current_time < ENDTIME:
-        attempt_times += 1
-        success_list, clients = login_and_reserve(
-            users,
-            usernames,
-            passwords,
-            action,
-            success_list,
-            clients,
-        )
-        print(
-            f"attempt time {attempt_times}, time now {current_time}, success list {success_list}"
-        )
-        current_time = get_current_time(action)
-        if success_list and sum(success_list) == today_reservation_num:
-            print("reserved successfully!")
-            return
 
-        if RUN_ONCE:
-            logging.info(
-        "单轮模式结束，不再重新生成验证码"
-    )
-            return
+    for index, user in enumerate(users):
+        username, password, times, roomid, seatid, daysofweek = user.values()
+        if action:
+            username, password = (
+                usernames.split(",")[index].strip(),
+                passwords.split(",")[index].strip(),
+            )
+        if current_dayofweek not in daysofweek:
+            logging.info("Today not set to reserve")
+            continue
+        if not login_user(clients[index], username, password):
+            continue
+        success_list[index] = two_shot_reserve(
+            clients[index],
+            times,
+            roomid,
+            seatid,
+            action,
+            prepared_packet=prepared.get(index) if action else None,
+        )
+
+    print(f"time now {current_time}, success list {success_list}")
+    if success_list and sum(success_list) == today_reservation_num:
+        print("reserved successfully!")
+        return
+    logging.info("两枪结束")
+    return
 
 def debug(users, action=False):
     logging.info(
@@ -200,7 +268,6 @@ def debug(users, action=False):
         s.warm_up()
         s.get_login_status()
         s.login(username, password)
-        s.requests.headers.update({"Host": "office.chaoxing.com"})
         suc = s.submit(times, roomid, seatid, action)
         if suc:
             return
@@ -218,7 +285,6 @@ def get_roomid(args1, args2):
     s.warm_up()
     s.get_login_status()
     s.login(username=username, password=password)
-    s.requests.headers.update({"Host": "office.chaoxing.com"})
     encode = input("请输入deptldEnc：")
     s.roomid(encode)
 

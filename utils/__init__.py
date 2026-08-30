@@ -12,4 +12,8 @@ def _fetch_env_variables(env_name, action):
 def get_user_credentials(action):
     usernames = _fetch_env_variables('USERNAMES', action)
     passwords = _fetch_env_variables('PASSWORDS', action)
+    if usernames:
+        usernames = usernames.strip()
+    if passwords:
+        passwords = passwords.strip()
     return usernames, passwords

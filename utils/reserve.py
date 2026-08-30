@@ -38,9 +38,10 @@ class reserve:
         self.submit_msg = []
         self.requests = requests.session()
         self.token_pattern = re.compile("token = '(.*?)'")
+        self.token_re = re.compile(r'id="submit_enc"\s+value="(.*?)"')
+        self.algo_re = re.compile(r'id="algorithm"\s+value="(.*?)"')
         self.headers = {
             "Referer": "https://office.chaoxing.com/",
-            "Host": "captcha.chaoxing.com",
             "Pragma": "no-cache",
             "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
             "Sec-Ch-Ua-Mobile": "?0",
@@ -112,24 +113,24 @@ class reserve:
 
     # login and page token
     def _get_page_token(self, url, require_value=False):
-        response = self.requests.get(url=url, verify=False)
-        html = response.content.decode("utf-8")
-        # matches = re.findall(r"token = \'(.*?)\'", html)
-        matches = re.findall(r'id="submit_enc"\s+value="(.*?)"', html)
-        value_matches = None
+        response = self.requests.get(url=url, verify=False, timeout=15)
+        html = response.content.decode("utf-8", "replace")
+        matches = self.token_re.findall(html)
+        algos = self.algo_re.findall(html)
+        token = matches[0] if matches else ""
+        algo = algos[0] if algos else token
         if require_value:
-            value_matches = re.findall(r'value="(.*?)"', html)
-            if not matches:
+            if not token:
                 logging.error(f"Failed to get token from {url}")
                 return "", ""
-            if not value_matches:
-                logging.error(f"Failed to get submit value from {url}")
-                return matches[0], ""
-        return matches[0] if matches else "", value_matches[0] if value_matches else ""
+            if not algo:
+                logging.error(f"Failed to get algorithm from {url}")
+                return token, ""
+        return token, algo
 
     def get_login_status(self):
-        self.requests.headers = self.login_headers
-        self.requests.get(url=self.login_page, verify=False)
+        self.requests.headers = dict(self.login_headers)
+        self.requests.get(url=self.login_page, verify=False, timeout=15)
 
     def login(self, username, password):
         username = AES_Encrypt(username)
@@ -141,18 +142,19 @@ class reserve:
             "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2Fcode%3Fid%3D4219%26seatNum%3D380",
             "t": True,
         }
-        jsons = self.requests.post(url=self.login_url, params=parm, verify=False)
+        jsons = self.requests.post(url=self.login_url, params=parm, verify=False, timeout=15)
         obj = jsons.json()
         if obj["status"]:
             self.logged_in = True
-            logging.info(f"User {username} login successfully")
+            self.requests.headers.pop("Host", None)
+            logging.info("login successfully")
             return (True, "")
         else:
             self.logged_in = False
             logging.info(
-                f"User {username} login failed. Please check you password and username! "
+                "login failed. Please check you password and username! "
             )
-            return (False, obj["msg2"])
+            return (False, obj.get("msg2") or obj.get("msg") or "")
 
     # extra: get roomid
     def roomid(self, encode):
@@ -246,7 +248,6 @@ class reserve:
 
         c_captcha_headers = {
             "Referer": "https://office.chaoxing.com/",
-            "Host": "captcha-b.chaoxing.com",
             "Pragma": "no-cache",
             "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
             "Sec-Ch-Ua-Mobile": "?0",
@@ -294,6 +295,60 @@ class reserve:
         if not normalized:
             raise ValueError("seatid cannot be empty")
         return normalized
+
+    def prepare_packet(self, times, roomid, seat, action):
+        started = time.perf_counter()
+        logging.info(f"开始做包 座位 {seat}")
+        token, algo = self._get_page_token(
+            self.url.format(roomid, seat),
+            require_value=True,
+        )
+        logging.info(f"Get token: {token}")
+        if not token or not algo:
+            logging.warning(f"座位 {seat} 做包失败：没有 token/algorithm")
+            return None
+        captcha = ""
+        if self.enable_slider:
+            captcha = self.resolve_captcha()
+            if not captcha:
+                logging.warning(f"座位 {seat} 做包失败：验证码失败")
+                return None
+        packet = {
+            "times": times,
+            "roomid": roomid,
+            "seat": seat,
+            "token": token,
+            "algo": algo,
+            "captcha": captcha,
+            "ready_at": time.time(),
+        }
+        logging.info(
+            f"做包完成 座位 {seat} 耗时 {time.perf_counter() - started:.3f}s"
+        )
+        return packet
+
+    def fire_packet(self, packet, action, label):
+        if not packet:
+            logging.warning(f"{label} 没有可发的包")
+            return False, "no-packet"
+        age = time.time() - packet.get("ready_at", time.time())
+        now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+        logging.info(
+            f"{label} SEND {now_bj.strftime('%H:%M:%S.%f')[:-3]} "
+            f"座位 {packet['seat']} packet_age={age:.3f}s"
+        )
+        ok, msg = self.get_submit(
+            self.submit_url,
+            times=packet["times"],
+            token=packet["token"],
+            roomid=packet["roomid"],
+            seatid=packet["seat"],
+            captcha=packet["captcha"],
+            action=action,
+            value=packet["algo"],
+        )
+        logging.info(f"{label} 回包 success={ok} msg={msg}")
+        return ok, msg
 
     def submit(
         self,
@@ -384,7 +439,7 @@ class reserve:
                 f"Captcha token {captcha}"
             )
 
-            success = self.get_submit(
+            success, _msg = self.get_submit(
                 self.submit_url,
                 times=times,
                 token=token,
@@ -459,13 +514,13 @@ class reserve:
             "verifyData": "1",
         }
         logging.info(f"submit parameter {parm} ")
-        # parm["enc"] = enc(parm)
         parm["enc"] = verify_param(parm, value)
-        html = self.requests.post(url=url, params=parm, verify=True).content.decode(
-            "utf-8"
-        )
+        html = self.requests.post(
+            url=url, params=parm, verify=True, timeout=15
+        ).content.decode("utf-8")
+        data = json.loads(html)
         self.submit_msg.append(
-            times[0] + "~" + times[1] + ":  " + str(json.loads(html))
+            times[0] + "~" + times[1] + ":  " + str(data)
         )
-        logging.info(json.loads(html))
-        return json.loads(html)["success"]
+        logging.info(data)
+        return bool(data.get("success")), data.get("msg", "")
