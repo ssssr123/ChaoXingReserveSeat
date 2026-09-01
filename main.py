@@ -6,29 +6,35 @@ import logging
 import datetime
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("reserve.log", encoding="utf-8"),
+    ],
 )
 
 
 from utils import reserve, get_user_credentials
 
-get_current_time = lambda action: (
-    time.strftime("%H:%M:%S", time.localtime(time.time() + 8 * 3600))
-    if action
-    else time.strftime("%H:%M:%S", time.localtime(time.time()))
-)
-get_current_dayofweek = lambda action: (
-    time.strftime("%A", time.localtime(time.time() + 8 * 3600))
-    if action
-    else time.strftime("%A", time.localtime(time.time()))
-)
+def beijing_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+
+
+def get_current_time(_action=False):
+    return beijing_now().strftime("%H:%M:%S")
+
+
+def get_current_dayofweek(_action=False):
+    return beijing_now().strftime("%A")
+
 
 RUN_ONCE = True
 SLEEPTIME = 0.2  # 每次抢座的间隔
 ENDTIME = "20:02:00"  # 根据学校的预约座位时间+1min即可
 RESERVE_TIME = "20:00:03"  # 北京时间，第一枪开火（T0+3s）
-PREWARM_LEAD_SECONDS = 25  # 开火前多少秒完成环境预热+登录
-PACKET_LEAD_SECONDS = 8  # 开火前多少秒开始做第一枪预热包
+PREWARM_LEAD_SECONDS = 40  # 开火前完成环境预热+登录
+PACKET_LEAD_SECONDS = 14  # 开火前开始做第一枪预热包，保证 20:00:03 包已就绪
 
 ENABLE_SLIDER = True  # 是否有滑块验证
 MAX_ATTEMPT = 1  # 最大尝试次数
@@ -36,8 +42,19 @@ RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 POST_LOGIN_DELAY = 0.0
 RETRY_INTERVAL = 15.0    # 整批失败后等待15秒
 
-def beijing_now():
-    return datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+
+def wait_until_fire(lead_seconds=0):
+    """Block until Beijing clock reaches RESERVE_TIME minus lead_seconds."""
+    fire_clock = datetime.datetime.strptime(RESERVE_TIME, "%H:%M:%S").time()
+    while True:
+        now = beijing_now()
+        target = datetime.datetime.combine(now.date(), fire_clock)
+        if (now - target).total_seconds() > 12 * 3600:
+            target += datetime.timedelta(days=1)
+        remaining = (target - now).total_seconds() - lead_seconds
+        if remaining <= 0:
+            return now, (target - now).total_seconds()
+        time.sleep(1 if remaining > 10 else 0.01)
 
 
 def create_reserve_clients(user_count):
@@ -77,15 +94,14 @@ def two_shot_reserve(client, times, roomid, seatid, action, prepared_packet=None
 
     packet1 = prepared_packet
     if packet1 is None:
-        logging.warning("开火时预热包未就绪，现场补做第一枪包")
-        packet1 = client.prepare_packet(times, roomid, seat, action)
-
-    ok1, msg1 = client.fire_packet(packet1, action, "第一枪")
-    packet1 = None
-    if ok1:
-        logging.info("第一枪预约成功")
-        return True
-    logging.info(f"第一枪结束 msg={msg1}，丢掉预热包，现场做第二枪")
+        logging.warning("开火时预热包未就绪，跳过第一枪，避免现场做包拖到 15 秒")
+    else:
+        ok1, msg1 = client.fire_packet(packet1, action, "第一枪")
+        packet1 = None
+        if ok1:
+            logging.info("第一枪预约成功")
+            return True
+        logging.info(f"第一枪结束 msg={msg1}，丢掉预热包，现场做第二枪")
 
     packet2 = client.prepare_packet(times, roomid, seat, action)
     ok2, msg2 = client.fire_packet(packet2, action, "第二枪")
@@ -150,53 +166,40 @@ def main(users, action=False):
     clients = None
     if action:
         usernames, passwords = get_user_credentials(action)
+        if not usernames or not passwords:
+            raise Exception("USERNAMES/PASSWORDS secrets missing")
 
-        # 2. 开火前：环境预热 + 登录 + 第一枪做包
-        fire_clock = datetime.datetime.strptime(RESERVE_TIME, "%H:%M:%S").time()
         logging.info(
-            f"GitHub Action 模式已启动，等待北京时间 {RESERVE_TIME} 打第一枪..."
+            f"GitHub Action 已启动，第一枪对准北京时间 {RESERVE_TIME}"
         )
         prepared = {}
-        while True:
-            now = beijing_now()
-            target = datetime.datetime.combine(now.date(), fire_clock)
-            if (now - target).total_seconds() > 12 * 3600:
-                target += datetime.timedelta(days=1)
-            remaining_seconds = (target - now).total_seconds()
 
-            if clients is None and remaining_seconds <= PREWARM_LEAD_SECONDS:
-                logging.info("开始预约前预热并登录...")
-                clients = create_reserve_clients(len(users))
-                for index, user in enumerate(users):
-                    username, password = (
-                        usernames.split(",")[index].strip(),
-                        passwords.split(",")[index].strip(),
-                    )
-                    login_user(clients[index], username, password)
+        wait_until_fire(PREWARM_LEAD_SECONDS)
+        logging.info("开始预约前预热并登录...")
+        clients = create_reserve_clients(len(users))
+        for index, user in enumerate(users):
+            username, password = (
+                usernames.split(",")[index].strip(),
+                passwords.split(",")[index].strip(),
+            )
+            if not login_user(clients[index], username, password):
+                logging.error(f"预热登录失败 index={index}")
 
-            if (
-                clients is not None
-                and remaining_seconds <= PACKET_LEAD_SECONDS
-            ):
-                for index, user in enumerate(users):
-                    if index in prepared:
-                        continue
-                    if not clients[index].logged_in:
-                        continue
-                    _username, _password, times, roomid, seatid, _days = user.values()
-                    seat = primary_seat(seatid)
-                    logging.info(f"开始准备第一枪预热包 座位 {seat}")
-                    prepared[index] = clients[index].prepare_packet(
-                        times, roomid, seat, action
-                    )
+        wait_until_fire(PACKET_LEAD_SECONDS)
+        for index, user in enumerate(users):
+            if not clients[index].logged_in:
+                continue
+            _username, _password, times, roomid, seatid, _days = user.values()
+            seat = primary_seat(seatid)
+            logging.info(f"开始准备第一枪预热包 座位 {seat}")
+            prepared[index] = clients[index].prepare_packet(
+                times, roomid, seat, action
+            )
 
-            if remaining_seconds <= 0:
-                logging.info(
-                    f"到达开火时间: {now.strftime('%H:%M:%S.%f')[:-3]}，打第一枪"
-                )
-                break
-
-            time.sleep(1 if remaining_seconds > 10 else 0.02)
+        now, remaining = wait_until_fire(0)
+        logging.info(
+            f"到达开火时间: {now.strftime('%H:%M:%S.%f')[:-3]} remaining={remaining:.3f}s，打第一枪"
+        )
 
     if clients is None:
         clients = create_reserve_clients(len(users))

@@ -28,8 +28,17 @@ jobs:
       - name: run script
         env:
           TZ: Asia/Shanghai
+          PYTHONUNBUFFERED: "1"
           USERNAMES: ${{ secrets.USERNAMES }}
           PASSWORDS: ${{ secrets.PASSWORDS }}
         run: |
           python main.py -m reserve --action
+
+      - name: upload reserve log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reserve-log
+          path: reserve.log
+          retention-days: 14
 
