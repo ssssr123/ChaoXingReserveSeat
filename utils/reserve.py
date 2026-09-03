@@ -289,6 +289,8 @@ class reserve:
             if not isinstance(seat, str):
                 raise TypeError("every seatid must be a string, for example '006'")
             seat = seat.strip()
+            if seat.isdigit():
+                seat = seat.zfill(3)
             if seat and seat not in normalized:
                 normalized.append(seat)
 
