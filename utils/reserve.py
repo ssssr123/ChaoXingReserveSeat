@@ -348,7 +348,9 @@ class reserve:
             action=action,
             value=packet["algo"],
         )
-        logging.info(f"{label} 回包 success={ok} msg={msg}")
+        logging.info(
+            f"座位 {packet['seat']} 提交返回：success={ok} msg={msg}"
+        )
         return ok, msg
 
     def submit(

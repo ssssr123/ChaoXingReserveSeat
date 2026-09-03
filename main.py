@@ -25,14 +25,18 @@ from utils import reserve, get_user_credentials
 _CX_OFFSET = 0.0
 
 
-def sync_chaoxing_clock(rounds=7):
+def sync_chaoxing_clock(rounds=3):
+    """安师大 exe server_offset：3 次 Date 头取中位数。不跟随跳转，避免绕到 cxlowcode 拖时间。"""
     global _CX_OFFSET
     samples = []
     for _ in range(rounds):
         t0 = time.time()
         try:
             resp = requests.get(
-                "https://office.chaoxing.com/", timeout=5, verify=False
+                "https://office.chaoxing.com/",
+                timeout=5,
+                verify=False,
+                allow_redirects=False,
             )
         except requests.RequestException as err:
             logging.warning(f"对超星钟失败: {err}")
@@ -75,7 +79,7 @@ SPRINT_LEAD_MS = 300  # 开放前 0.3 秒开火
 SPRINT_PREP_SECONDS = 4  # 等到 t0-4 秒才开始做第一座的包
 RUN_SECONDS = 6  # 狂刷时长
 RESERVE_TIME = "20:00:00"
-LOGIN_LEAD_SECONDS = 20  # GitHub 19:20 开工，登录提前量；exe 是定时 19:59 启动后立刻登录
+LOGIN_LEAD_SECONDS = 20  # 对齐 exe：约 19:59:40 登录，再等到 t0-4 做包
 
 ENABLE_SLIDER = True
 MAX_ATTEMPT = 1
@@ -242,24 +246,31 @@ def main(users, action=False):
             raise Exception("USERNAMES/PASSWORDS secrets missing")
 
         logging.info("GitHub Action 已启动，按安师大 exe 冲刺：lead=300ms run=6s sleep=0.1s")
+        # OpenCV/连接放在 19:20 做完，不能占开火前那几秒
+        clients = create_reserve_clients(len(users))
         sync_chaoxing_clock()
         t0_local, fire_at, prep_at = exe_fire_timestamps()
         logging.info(
             f"冲刺模式：开放 {OPEN_TIME}，服务器时钟偏差 {_CX_OFFSET:+.2f}s，"
             f"将于本机 {datetime.datetime.fromtimestamp(fire_at).strftime('%H:%M:%S.%f')[:-3]} 开火"
         )
-        precise_sleep_until(prep_at - LOGIN_LEAD_SECONDS)
-        sync_chaoxing_clock()
-        t0_local, fire_at, prep_at = exe_fire_timestamps()
-        logging.info("开始预约前预热并登录...")
-        clients = create_reserve_clients(len(users))
+        # 对齐 exe 截图：约 19:59:42 登录，不是等到做包前才登录
+        precise_sleep_until(t0_local - LOGIN_LEAD_SECONDS)
+        logging.info("开始登录...")
         for index, user in enumerate(users):
             username, password = (
                 usernames.split(",")[index].strip(),
                 passwords.split(",")[index].strip(),
             )
             if not login_user(clients[index], username, password):
-                logging.error(f"预热登录失败 index={index}")
+                logging.error(f"登录失败 index={index}")
+        # 登录后再对钟，和 exe 一样
+        sync_chaoxing_clock()
+        t0_local, fire_at, prep_at = exe_fire_timestamps()
+        logging.info(
+            f"冲刺模式：开放 {OPEN_TIME}，服务器时钟偏差 {_CX_OFFSET:+.2f}s，"
+            f"将于本机 {datetime.datetime.fromtimestamp(fire_at).strftime('%H:%M:%S.%f')[:-3]} 开火"
+        )
 
     if clients is None:
         clients = create_reserve_clients(len(users))
